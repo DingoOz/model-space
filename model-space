@@ -1,0 +1,2629 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Nigel H-S
+"""
+model-space — disk usage across every filesystem, plus tools to move and prune
+local LLM model files.
+
+  model-space                  # TUI
+  model-space --rescan         # ignore the cached index on startup
+  model-space --min-size 1G    # hide models smaller than this (default 200M)
+  model-space --root /data     # also scan this folder (repeatable)
+  model-space --list           # print the model index and exit (no TUI)
+
+Tabs:  1  Storage    used / free on every disk, and how much of it is models
+       2  Move       pick models, pick a destination disk + folder, move them
+       3  Clean up   models sorted by last use; select and delete
+
+Keys (tables):  space/enter  select row     a  select all shown    n  clear selection
+                /            filter         m  move (tab 2)        d  delete (tab 3)
+                click a column header to sort        r  rescan     q  quit
+
+How models are found: every real filesystem is walked (system dirs on / are
+skipped) for weight files (.gguf .safetensors .bin .pt .pth .ckpt .onnx ...),
+Ollama stores and the Hugging Face hub cache. Multi-part shards are grouped into
+one model, and a folder that is mostly weights (a quant folder, an HF snapshot)
+is treated as one model so it moves and deletes as a unit.
+
+"Last used" is the newest atime of the model's files. With relatime (Ubuntu's
+default) atime is bumped at most once a day when a file is read or mmapped, so
+it is accurate to about a day — but anything else that reads the file (a backup,
+a checksum) also counts as use.
+
+Moves within one filesystem are a rename. Across filesystems the files are
+copied with progress (bypassing the page cache so a running model's cache isn't
+evicted), verified, and only then are the originals removed. By default a
+symlink is left at the old location so systemd units and scripts that point at
+it keep working; existing symlinks to the model are retargeted either way.
+Models that a process has open or mmapped are never moved or deleted.
+"""
+
+import argparse
+import errno
+import json
+import os
+import queue
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import threading
+import time
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from types import SimpleNamespace
+
+from rich.text import Text
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.widget import Widget
+from textual.widgets import (
+    Button, Checkbox, DataTable, DirectoryTree, Footer, Header, Input, Label,
+    OptionList, ProgressBar, RichLog, Select, Static, TabbedContent, TabPane,
+)
+from textual.widgets.option_list import Option
+
+HOME = str(Path.home())
+CACHE_FILE = Path(HOME) / ".cache/model-space/index.json"
+CONFIG_FILE = Path(HOME) / ".config/model-space/config.json"
+CACHE_VERSION = 1
+
+REAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "bcachefs",
+           "reiserfs", "vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "nfs", "nfs4",
+           "cifs", "smb3"}
+
+KIND_BY_EXT = {".gguf": "gguf", ".ggml": "ggml", ".safetensors": "safetensors",
+               ".bin": "bin", ".pt": "pytorch", ".pth": "pytorch", ".ckpt": "ckpt",
+               ".onnx": "onnx", ".tflite": "tflite", ".mlmodel": "coreml",
+               ".pte": "executorch", ".llamafile": "llamafile"}
+PARTIAL_EXT = {".incomplete", ".part", ".partial", ".download", ".crdownload"}
+SHARD_RE = re.compile(r"^(?P<prefix>.+?)-(?P<idx>\d{4,5})-of-(?P<total>\d{4,5})(?P<ext>\.[^.]+)$")
+QUANT_RE = re.compile(r"^(ud[-_])?(i?q\d|bf16|f16|f32|fp8|fp16|nvfp4|mxfp4|int[48]|awq|gptq)", re.I)
+
+# Never descend into these anywhere.
+SKIP_DIR_NAMES = {".git", ".hg", ".svn", "node_modules", "__pycache__", "site-packages",
+                  "dist-packages", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+                  ".npm", ".cargo", ".rustup", ".gradle", ".m2", ".pyenv", ".nvm"}
+# Top-level dirs of / that hold the OS rather than data.
+ROOT_SKIP_TOP = {"proc", "sys", "dev", "run", "boot", "etc", "bin", "sbin", "lib", "lib32",
+                 "lib64", "libx32", "usr", "snap", "lost+found", "var", "cdrom"}
+ROOT_EXTRA = ["/usr/share/ollama", "/usr/local/share", "/var/lib/ollama", "/var/tmp"]
+NO_SCAN_MOUNTS = {"/boot", "/boot/efi"}
+# Folder names that say nothing about the model inside them.
+GENERIC_DIR_NAMES = {"models", "model", "weights", "checkpoints", "checkpoint", "gguf", "hf",
+                     "text_encoders", "diffusion_models", "vae", "unet", "clip", "loras",
+                     "pack", "packs", "vision", "snapshots", "data", "files", "out", "output"}
+GENERIC_STEMS = {"model", "pytorch_model", "consolidated", "diffusion_pytorch_model",
+                 "adapter_model", "weights", "dense", "experts", "tf_model", "flax_model",
+                 "model_state", "params"}
+# Subfolders that are parts of the model in their parent folder (a vision
+# projector, a draft/MTP head, text encoders ...) rather than models of their own.
+AUX_SUBDIRS = {"vision", "mmproj", "text_encoders", "text_encoder", "vae", "unet", "transformer",
+               "tokenizer", "pack", "packs", "mtp", "draft", "onnx", "clip", "image_encoder",
+               "audio_encoder", "diffusion_models", "loras", "original", "speculator", "assistant"}
+# A folder with one of these names is never treated as a single model.
+NEVER_FOLDER_UNIT = {"downloads", "desktop", "documents", "music", "pictures", "videos",
+                     "public", "templates", "tmp", "trash"}
+
+MIN_FILE = 1 << 20           # ignore weight-named files smaller than 1 MiB
+FOLDER_WEIGHT_SHARE = 0.90   # a folder is one model if weights are >= 90% of its bytes
+FOLDER_MAX_FILES = 2000
+FREE_MARGIN = 1 << 30        # keep 1 GiB free on the destination
+CHUNK = 64 << 20
+SYNC_EVERY = 1 << 30
+
+
+# ─── formatting ──────────────────────────────────────────────────────────────
+
+def human(n: float) -> str:
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            break
+        n /= 1024
+    if unit == "B":
+        return f"{int(n)} B"
+    return f"{n:.1f} {unit}" if abs(n) < 100 else f"{n:.0f} {unit}"
+
+
+def parse_size(s: str) -> int:
+    m = re.fullmatch(r"\s*([\d.]+)\s*([kmgt]?)i?b?\s*", s.lower())
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad size: {s!r}")
+    return int(float(m[1]) * 1024 ** " kmgt".index(m[2] or " "))
+
+
+def days_since(ts: float) -> float:
+    return max(0.0, (time.time() - ts) / 86400) if ts else 1e9
+
+
+def ago(ts: float) -> str:
+    if not ts:
+        return "never"
+    d = days_since(ts)
+    if d < 1:
+        return "today"
+    if d < 2:
+        return "yesterday"
+    if d < 14:
+        return f"{int(d)}d ago"
+    if d < 60:
+        return f"{int(d / 7)}w ago"
+    if d < 730:
+        return f"{int(d / 30.4)}mo ago"
+    return f"{d / 365:.1f}y ago"
+
+
+def used_label(m) -> str:
+    return ago(m.last_used) + ("*" if m.bulk else "")
+
+
+def short_path(p: str, width: int = 0) -> str:
+    if p == HOME or p.startswith(HOME + "/"):
+        p = "~" + p[len(HOME):]
+    if width and len(p) > width:
+        p = "…" + p[-(width - 1):]
+    return p
+
+
+def bar_text(width: int, segments, total: float) -> Text:
+    """One line of a stacked bar. segments: [(value, style, char)]."""
+    t = Text()
+    if width <= 0:
+        return t
+    if not segments or not any(v > 0 for v, _, _ in segments):
+        return Text(" " * width)
+    total = total or 1
+    raw = [max(0.0, v) / total * width for v, _, _ in segments]
+    cells = [int(r) for r in raw]
+    # Anything non-zero gets at least one cell, then hand out the remainder.
+    for i, (v, _, _) in enumerate(segments):
+        if v > 0 and cells[i] == 0 and raw[i] > 0.05:
+            cells[i] = 1
+    while sum(cells) < width:
+        i = max(range(len(raw)), key=lambda j: raw[j] - cells[j])
+        cells[i] += 1
+    while sum(cells) > width:
+        i = max(range(len(cells)), key=lambda j: cells[j])
+        cells[i] -= 1
+    for n, (_, style, ch) in zip(cells, segments):
+        if n:
+            t.append(ch * n, style=style)
+    return t
+
+
+def palette(app: App) -> SimpleNamespace:
+    v = app.get_css_variables()
+    return SimpleNamespace(
+        fg=v.get("foreground", "white"), muted=v.get("foreground-darken-2", "grey50"),
+        primary=v.get("primary", "magenta"), secondary=v.get("secondary", "blue"),
+        accent=v.get("accent", "yellow"), ok=v.get("success", "green"),
+        warn=v.get("warning", "yellow"), err=v.get("error", "red"),
+        track=v.get("panel-lighten-2", v.get("panel", "grey30")))
+
+
+def level_style(p, frac: float) -> str:
+    return p.err if frac >= 0.9 else p.warn if frac >= 0.75 else p.ok
+
+
+def age_style(p, ts: float) -> str:
+    d = days_since(ts)
+    return p.ok if d < 7 else p.secondary if d < 30 else p.warn if d < 90 else p.err
+
+
+# ─── disks ───────────────────────────────────────────────────────────────────
+
+@dataclass
+class Disk:
+    mount: str
+    device: str
+    fstype: str
+    dev: int
+    total: int
+    used: int
+    free: int
+    label: str = ""
+
+    @property
+    def frac(self) -> float:
+        return self.used / ((self.used + self.free) or 1)
+
+    def refresh(self) -> None:
+        try:
+            v = os.statvfs(self.mount)
+        except OSError:
+            return
+        self.total = v.f_blocks * v.f_frsize
+        self.used = (v.f_blocks - v.f_bfree) * v.f_frsize
+        self.free = v.f_bavail * v.f_frsize
+
+
+def _unescape(s: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), s)
+
+
+def mount_points() -> set[str]:
+    pts = set()
+    with open("/proc/self/mounts") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) > 1:
+                pts.add(_unescape(parts[1]))
+    return pts
+
+
+_lsblk_cache: list | None = None
+
+
+def describe_device(dev: str) -> str:
+    """'Samsung SSD 990 PRO · NVMe SSD · nvme0n1' style description of a block device."""
+    global _lsblk_cache
+    if _lsblk_cache is None:
+        try:
+            out = subprocess.run(["lsblk", "-J", "-l", "-o", "PATH,KNAME,PKNAME,MODEL,ROTA,TRAN,TYPE"],
+                                 capture_output=True, text=True, timeout=5).stdout
+            _lsblk_cache = json.loads(out)["blockdevices"]
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            _lsblk_cache = []
+    by_path = {d.get("path"): d for d in _lsblk_cache}
+    by_kname = {d.get("kname"): d for d in _lsblk_cache}
+    real = os.path.realpath(dev)
+    d = by_path.get(dev) or by_path.get(real) or by_kname.get(os.path.basename(real))
+    if not d:
+        return ""
+    chain = [d]
+    while d.get("type") != "disk" and d.get("pkname") in by_kname:
+        d = by_kname[d["pkname"]]
+        chain.append(d)
+    disk = chain[-1]
+    bits = []
+    if (disk.get("model") or "").strip():
+        bits.append(disk["model"].strip())
+    tran = (disk.get("tran") or "").lower()
+    if tran == "nvme":
+        bits.append("NVMe SSD")
+    else:
+        bits.append(("HDD" if disk.get("rota") in (True, 1, "1") else "SSD") + (f" ({tran.upper()})" if tran else ""))
+    layers = [c.get("type", "") for c in chain[:-1]]
+    if "lvm" in layers:
+        bits.append("LVM")
+    bits += [t.upper() for t in layers if t.startswith("raid")][:1]
+    bits.append(disk.get("kname", ""))
+    return " · ".join(b for b in bits if b)
+
+
+def get_disks() -> list[Disk]:
+    disks: dict[int, Disk] = {}
+    with open("/proc/self/mounts") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            dev, mnt, fstype = parts[0], _unescape(parts[1]), parts[2]
+            if fstype not in REAL_FS or mnt.startswith("/snap/"):
+                continue
+            try:
+                st, v = os.stat(mnt), os.statvfs(mnt)
+            except OSError:
+                continue
+            if v.f_blocks == 0:
+                continue
+            if st.st_dev in disks and len(disks[st.st_dev].mount) <= len(mnt):
+                continue
+            fr = v.f_frsize
+            disks[st.st_dev] = Disk(mnt, dev, fstype, st.st_dev, v.f_blocks * fr,
+                                    (v.f_blocks - v.f_bfree) * fr, v.f_bavail * fr,
+                                    describe_device(dev))
+    return sorted(disks.values(), key=lambda d: (d.mount != "/", d.mount))
+
+
+def disk_for_path(disks: list[Disk], path: str) -> Disk | None:
+    """The disk a (possibly not yet existing) path would live on."""
+    p = os.path.abspath(path)
+    while not os.path.exists(p) and p != "/":
+        p = os.path.dirname(p)
+    try:
+        dev = os.stat(p).st_dev
+    except OSError:
+        return None
+    return next((d for d in disks if d.dev == dev), None)
+
+
+# ─── models ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class Model:
+    key: str
+    name: str
+    kind: str                 # gguf, safetensors, bin, pytorch, onnx, partial, ...
+    path: str                 # the folder for folder models, else the first file
+    is_dir: bool
+    files: list               # weight files (inside the folder, for folder models)
+    nfiles: int
+    size: int                 # bytes allocated on disk
+    frees: int                # bytes deleting it would free (hard links, shared blobs excluded)
+    last_used: float
+    mtime: float
+    dev: int
+    signature: list           # [(basename, size)] of the main weights, for spotting copies
+    source: str = ""          # "" | "hf" | "ollama"
+    links: list = field(default_factory=list)   # symlinks elsewhere that point into it
+    extra: dict = field(default_factory=dict)
+    # runtime only, recomputed after every scan / load
+    users: list = field(default_factory=list)      # ["llama-server[1234]"]
+    services: list = field(default_factory=list)   # [("x.service", "active")]
+    dups: list = field(default_factory=list)       # paths of copies
+    writable: bool = True
+    bulk: int = 0             # >0: atime shared with this many others (a backup/scan read them)
+
+    RUNTIME = ("users", "services", "dups", "writable", "bulk")
+
+    def to_json(self) -> dict:
+        d = asdict(self)
+        for k in self.RUNTIME:
+            d.pop(k)
+        return d
+
+    @classmethod
+    def from_json(cls, d: dict) -> "Model":
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
+
+    @property
+    def location(self) -> str:
+        """The folder for folder models (with a trailing /), else the containing folder."""
+        if self.source == "ollama":
+            return self.extra.get("store", os.path.dirname(self.path)) + "/"
+        return self.path + "/" if self.is_dir else os.path.dirname(self.path)
+
+    @property
+    def format_label(self) -> str:
+        if self.source == "ollama":
+            return "Ollama"
+        label = {"gguf": "GGUF", "safetensors": "safetensors", "pytorch": "PyTorch",
+                 "onnx": "ONNX", "partial": "partial", "bin": "bin"}.get(self.kind, self.kind)
+        if self.source == "hf":
+            return f"HF {label}"
+        return f"{label} ×{self.nfiles}" if self.nfiles > 1 else label
+
+
+def looks_weight(name: str) -> bool:
+    n = name.lower()
+    stem, ext = os.path.splitext(n)
+    if ext in KIND_BY_EXT:
+        return True
+    if ext in PARTIAL_EXT:
+        return ext == ".incomplete" or os.path.splitext(stem)[1] in KIND_BY_EXT
+    return False
+
+
+def is_partial(name: str) -> bool:
+    return os.path.splitext(name.lower())[1] in PARTIAL_EXT
+
+
+@dataclass
+class FileRec:
+    path: str
+    size: int     # allocated bytes
+    apparent: int
+    atime: float
+    mtime: float
+    dev: int
+    ino: int
+    nlink: int
+
+
+class Scanner:
+    """Parallel walk of every filesystem collecting weight files, symlinks, HF
+    hub repos and Ollama stores."""
+
+    def __init__(self, disks: list[Disk], extra_roots=(), progress=None, threads: int = 12):
+        self.disks = disks
+        self.extra_roots = [os.path.abspath(r) for r in extra_roots]
+        self.progress = progress
+        self.threads = threads
+        self.mounts = mount_points()
+        self.files: list[FileRec] = []
+        self.links: list[str] = []
+        self.hf_dirs: list[str] = []
+        self.ollama_stores: list[str] = []
+        self.dirs_seen = 0
+        self._lock = threading.Lock()
+        self._last_report = 0.0
+
+    def roots(self) -> list[str]:
+        out = []
+        for d in self.disks:
+            if d.mount in NO_SCAN_MOUNTS:
+                continue
+            if d.mount == "/":
+                try:
+                    top = sorted(os.listdir("/"))
+                except OSError:
+                    top = []
+                for name in top:
+                    p = "/" + name
+                    if name not in ROOT_SKIP_TOP and p not in self.mounts \
+                            and os.path.isdir(p) and not os.path.islink(p):
+                        out.append(p)
+                out += [p for p in ROOT_EXTRA if os.path.isdir(p)]
+            else:
+                out.append(d.mount)
+        for r in self.extra_roots:
+            if os.path.isdir(r) and not any(r == o or r.startswith(o.rstrip("/") + "/") for o in out):
+                out.append(r)
+        return out
+
+    def _visit(self, d: str, q: queue.Queue) -> None:
+        try:
+            it = os.scandir(d)
+        except OSError:
+            return
+        with it:
+            for e in it:
+                try:
+                    if e.is_symlink():
+                        self.links.append(e.path)
+                    elif e.is_dir(follow_symlinks=False):
+                        if e.name in SKIP_DIR_NAMES or e.path in self.mounts:
+                            continue
+                        if e.name.startswith("models--") and os.path.basename(d) == "hub":
+                            self.hf_dirs.append(e.path)
+                        elif e.name == "blobs" and os.path.isdir(os.path.join(d, "manifests")):
+                            self.ollama_stores.append(d)
+                        elif e.name == "manifests" and os.path.isdir(os.path.join(d, "blobs")):
+                            pass
+                        else:
+                            q.put(e.path)
+                    elif e.is_file(follow_symlinks=False) and looks_weight(e.name):
+                        st = e.stat(follow_symlinks=False)
+                        if st.st_size >= MIN_FILE:
+                            self.files.append(FileRec(e.path, st.st_blocks * 512, st.st_size,
+                                                      st.st_atime, st.st_mtime, st.st_dev,
+                                                      st.st_ino, st.st_nlink))
+                except OSError:
+                    pass
+        with self._lock:
+            self.dirs_seen += 1
+            now = time.monotonic()
+            if self.progress and now - self._last_report > 0.1:
+                self._last_report = now
+                self.progress(self.dirs_seen, d)
+
+    def walk(self) -> None:
+        q: queue.Queue = queue.Queue()
+        for r in self.roots():
+            q.put(r)
+
+        def worker():
+            while True:
+                d = q.get()
+                if d is None:
+                    q.task_done()
+                    return
+                try:
+                    self._visit(d, q)
+                except Exception:
+                    pass  # one unreadable folder must not stall the whole walk
+                finally:
+                    q.task_done()
+
+        ts = [threading.Thread(target=worker, daemon=True) for _ in range(self.threads)]
+        for t in ts:
+            t.start()
+        q.join()
+        for _ in ts:
+            q.put(None)
+        for t in ts:
+            t.join()
+
+    def run(self, min_size: int) -> list[Model]:
+        self.walk()
+        protected = set(self.mounts) | set(self.roots()) | {HOME, "/"}
+        models = build_models(self.files, protected)
+        models += [m for d in self.hf_dirs if (m := hf_model(d))]
+        for s in self.ollama_stores:
+            models += ollama_models(s)
+        models = [m for m in models if m.size >= min_size]
+        attach_links(models, self.links)
+        return models
+
+
+@dataclass
+class Group:
+    dir: str
+    key: tuple
+    files: list
+
+    @property
+    def partial(self) -> bool:
+        return self.key[0] == "partial"
+
+    @property
+    def ext(self) -> str:
+        return self.key[2] if self.key[0] == "shard" else os.path.splitext(self.key[1])[1].lower()
+
+    @property
+    def kind(self) -> str:
+        return "partial" if self.partial else KIND_BY_EXT.get(self.ext, "weights")
+
+    @property
+    def stem(self) -> str:
+        if self.partial:
+            return f"partial download ({os.path.basename(self.dir)})"
+        s = self.key[1] if self.key[0] == "shard" else os.path.splitext(self.key[1])[0]
+        if s.lower() in GENERIC_STEMS or s.lower().startswith("mmproj"):
+            return f"{os.path.basename(self.dir)}/{s}"
+        return s
+
+    @property
+    def primary_gguf(self) -> bool:
+        return (self.kind == "gguf"
+                and not os.path.basename(self.files[0].path).lower().startswith("mmproj"))
+
+    @property
+    def size(self) -> int:
+        return sum(f.size for f in self.files)
+
+
+def group_files(files: list[FileRec]) -> dict[str, list[Group]]:
+    by_dir: dict[str, dict[tuple, list]] = defaultdict(lambda: defaultdict(list))
+    for f in files:
+        d, name = os.path.split(f.path)
+        if name.lower().endswith(".bin") and os.path.exists(f.path[:-4] + ".cue"):
+            continue  # a CD image, not weights
+        if is_partial(name):
+            key = ("partial",)
+        elif m := SHARD_RE.match(name):
+            key = ("shard", m["prefix"], m["ext"].lower())
+        else:
+            key = ("single", name)
+        by_dir[d][key].append(f)
+    return {d: [Group(d, k, sorted(fs, key=lambda f: f.path)) for k, fs in g.items()]
+            for d, g in by_dir.items()}
+
+
+def measure_dir(d: str, mounts_or_protected: set) -> tuple[bool, int]:
+    """(ok, allocated bytes) for everything under d, giving up on huge trees."""
+    total, n = 0, 0
+    for root, dirs, files in os.walk(d):
+        if any(os.path.join(root, x) in mounts_or_protected for x in dirs):
+            return False, 0
+        for x in files:
+            n += 1
+            if n > FOLDER_MAX_FILES:
+                return False, 0
+            try:
+                total += os.lstat(os.path.join(root, x)).st_blocks * 512
+            except OSError:
+                pass
+    return True, total
+
+
+def sig_name(path: str) -> str:
+    """File name for duplicate matching; generic names (dense.bin) keep their folder."""
+    d, base = os.path.split(path)
+    stem = os.path.splitext(base)[0].lower()
+    if stem in GENERIC_STEMS or SHARD_RE.match(base) and SHARD_RE.match(base)["prefix"].lower() in GENERIC_STEMS:
+        return f"{os.path.basename(d)}/{base}"
+    return base
+
+
+def model_from_files(name, kind, path, is_dir, recs: list[FileRec], size, sig_recs) -> Model:
+    return Model(
+        key=path, name=name, kind=kind, path=path, is_dir=is_dir,
+        files=[f.path for f in recs], nfiles=len(recs), size=size,
+        frees=size - sum(f.size for f in recs if f.nlink > 1),
+        last_used=max(max(f.atime, f.mtime) for f in recs),
+        mtime=max(f.mtime for f in recs), dev=recs[0].dev,
+        signature=sorted([sig_name(f.path), f.apparent] for f in sig_recs))
+
+
+def build_models(files: list[FileRec], protected: set) -> list[Model]:
+    groups = group_files(files)
+    # Count primary GGUF groups in every subtree: a folder holding two
+    # different quants is a collection, not one model.
+    gguf_in = Counter()
+    for d, gs in groups.items():
+        c = sum(g.primary_gguf for g in gs)
+        p = d
+        while c:
+            gguf_in[p] += c
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+
+    folders: list[str] = []
+    for d in sorted(groups, key=lambda x: x.count("/")):
+        if any(d.startswith(f + "/") for f in folders):
+            continue
+        if all(g.partial for g in groups[d]):
+            continue
+        if (d in protected or d.count("/") < 2 or gguf_in[d] > 1
+                or os.path.basename(d).lower() in NEVER_FOLDER_UNIT
+                or os.path.dirname(d) == HOME or os.path.exists(os.path.join(d, ".git"))):
+            continue
+        # Weights in subfolders are only absorbed if they look like parts of this
+        # model; a sibling model moved into the same folder must stay separate.
+        if any(os.path.relpath(gd, d).split("/")[0].lower() not in AUX_SUBDIRS
+               for gd, gs in groups.items()
+               if gd.startswith(d + "/") and not all(g.partial for g in gs)):
+            continue
+        ok, total = measure_dir(d, protected)
+        weights = sum(f.size for f in files if f.path.startswith(d + "/"))
+        if ok and total and weights >= FOLDER_WEIGHT_SHARE * total:
+            folders.append(d)
+
+    models = []
+    for d in folders:
+        inner = [g for gd, gs in groups.items() if gd == d or gd.startswith(d + "/") for g in gs]
+        recs = [f for g in inner for f in g.files]
+        main = max(inner, key=lambda g: g.size)
+        base = os.path.basename(d)
+        if main.primary_gguf:
+            name = main.stem  # the file name carries the quant; folder names often don't
+        elif base.lower() in GENERIC_DIR_NAMES or QUANT_RE.match(base):
+            name = f"{os.path.basename(os.path.dirname(d))}/{base}"
+        else:
+            name = base
+        _, total = measure_dir(d, protected)
+        models.append(model_from_files(name, main.kind, d, True, recs, total, main.files))
+
+    for d, gs in groups.items():
+        if any(d == f or d.startswith(f + "/") for f in folders):
+            continue
+        for g in gs:
+            models.append(model_from_files(g.stem, g.kind, g.files[0].path, False, g.files,
+                                           g.size, g.files))
+    return models
+
+
+def hf_model(d: str) -> Model | None:
+    """A Hugging Face hub cache repo (models--org--name)."""
+    total, blobs, exts = 0, [], Counter()
+    for root, _, names in os.walk(d):
+        for x in names:
+            p = os.path.join(root, x)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                exts[os.path.splitext(x)[1].lower()] += 1
+            elif stat.S_ISREG(st.st_mode):
+                total += st.st_blocks * 512
+                if os.path.basename(root) == "blobs":
+                    blobs.append(FileRec(p, st.st_blocks * 512, st.st_size, st.st_atime,
+                                         st.st_mtime, st.st_dev, st.st_ino, st.st_nlink))
+    if not blobs:
+        return None
+    kind = next((KIND_BY_EXT[e] for e, _ in exts.most_common() if e in KIND_BY_EXT), "weights")
+    m = model_from_files(os.path.basename(d)[len("models--"):].replace("--", "/", 1), kind,
+                         d, True, blobs, total, blobs)
+    m.source = "hf"
+    return m
+
+
+def _manifest_digests(path: Path) -> list[str]:
+    data = json.loads(path.read_text())
+    ds = [layer["digest"] for layer in data.get("layers", [])]
+    if data.get("config", {}).get("digest"):
+        ds.append(data["config"]["digest"])
+    return ds
+
+
+def ollama_manifests(store: str) -> dict[Path, list[str]]:
+    out = {}
+    for p in (Path(store) / "manifests").rglob("*"):
+        try:
+            if p.is_file():
+                out[p] = _manifest_digests(p)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return out
+
+
+def ollama_models(store: str) -> list[Model]:
+    manifests = ollama_manifests(store)
+    refs = Counter(d for ds in manifests.values() for d in set(ds))
+    mdir, bdir = Path(store) / "manifests", Path(store) / "blobs"
+    models = []
+    for mpath, digests in manifests.items():
+        parts = mpath.relative_to(mdir).parts
+        if len(parts) < 2:
+            continue
+        *repo, tag = parts
+        if repo[:2] == ["registry.ollama.ai", "library"]:
+            repo = repo[2:]
+        elif repo[:1] == ["registry.ollama.ai"]:
+            repo = repo[1:]
+        name = f"{'/'.join(repo)}:{tag}"
+        recs, frees = [], 0
+        for dg in dict.fromkeys(digests):
+            bp = bdir / dg.replace(":", "-")
+            try:
+                st = bp.stat()
+            except OSError:
+                continue
+            recs.append(FileRec(str(bp), st.st_blocks * 512, st.st_size, st.st_atime,
+                                st.st_mtime, st.st_dev, st.st_ino, st.st_nlink))
+            if refs[dg] == 1:
+                frees += st.st_blocks * 512
+        if not recs:
+            continue
+        big = max(recs, key=lambda f: f.size)
+        m = model_from_files(name, "gguf", str(mpath), False, recs, sum(f.size for f in recs), [big])
+        m.key = f"ollama:{mpath}"
+        m.source, m.frees = "ollama", frees
+        m.last_used = max(f.atime for f in recs)
+        m.extra = {"store": store, "manifest": str(mpath), "name": name,
+                   "sizes": {f.path: f.size for f in recs}}
+        models.append(m)
+    return models
+
+
+def attach_links(models: list[Model], links: list[str]) -> None:
+    by_file = {f: m for m in models for f in m.files}
+    folders = sorted((m for m in models if m.is_dir), key=lambda m: -len(m.path))
+    for m in models:
+        m.links = []
+    for link in links:
+        try:
+            target = os.path.realpath(link)
+        except OSError:
+            continue
+        m = by_file.get(target)
+        if m is None:
+            m = next((f for f in folders if target == f.path or target.startswith(f.path + "/")), None)
+        if m is not None and not (m.is_dir and link.startswith(m.path + "/")):
+            m.links.append(link)
+
+
+# ─── runtime facts: who has it open, which units mention it, copies ──────────
+
+def open_weight_files() -> dict[str, set]:
+    """path -> {"comm[pid]"} for every weight file a readable process has open or mapped."""
+    users: dict[str, set] = defaultdict(set)
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        base = f"/proc/{pid}"
+        paths = set()
+        try:
+            for fd in os.listdir(base + "/fd"):
+                try:
+                    paths.add(os.readlink(f"{base}/fd/{fd}"))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        try:
+            with open(base + "/maps") as f:
+                for line in f:
+                    i = line.find("/")
+                    if i != -1:
+                        paths.add(line[i:].rstrip("\n").removesuffix(" (deleted)"))
+        except OSError:
+            pass
+        paths = {p for p in paths if p.startswith("/") and
+                 (looks_weight(os.path.basename(p)) or "/blobs/" in p)}
+        if not paths:
+            continue
+        try:
+            comm = Path(base, "comm").read_text().strip()
+        except OSError:
+            comm = "?"
+        for p in paths:
+            users[p].add(f"{comm}[{pid}]")
+    return users
+
+
+def users_of(m: Model, omap: dict[str, set]) -> list[str]:
+    found = set()
+    if m.is_dir:
+        prefix = m.path + "/"
+        for p, us in omap.items():
+            if p.startswith(prefix):
+                found |= us
+    for f in m.files:
+        found |= omap.get(f, set())
+    return sorted(found)
+
+
+def unit_texts() -> dict[str, tuple[str, list[str]]]:
+    """systemd unit name -> (its text plus any scripts/env files it runs, the
+    folders relative paths in that text are likely relative to)."""
+    out = {}
+    for d in ("/etc/systemd/system", os.path.join(HOME, ".config/systemd/user")):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            p = os.path.join(d, name)
+            if not name.endswith(".service") or not os.path.isfile(p) \
+                    or os.path.realpath(p) == "/dev/null":
+                continue
+            try:
+                text = Path(p).read_text(errors="replace")
+            except OSError:
+                continue
+            parts, bases = [text], []
+            for line in text.splitlines():
+                k, _, v = line.partition("=")
+                k = k.strip()
+                if k == "WorkingDirectory":
+                    bases.append(v.strip().lstrip("-"))
+                if k not in ("ExecStart", "ExecStartPre", "ExecStartPost", "EnvironmentFile"):
+                    continue
+                for tok in v.split():
+                    tok = tok.lstrip("-+@!:")
+                    try:
+                        if tok.startswith("/") and os.path.isfile(tok) and os.path.getsize(tok) < 512_000:
+                            data = Path(tok).read_bytes()
+                            if b"\0" not in data[:4096]:
+                                parts.append(data.decode(errors="replace"))
+                                bases.append(os.path.dirname(tok))
+                    except OSError:
+                        pass
+            blob = "\n".join(parts)
+            blob = blob.replace("${HOME}", HOME).replace("$HOME", HOME).replace("~/", HOME + "/")
+            out[name] = (blob, [b for b in bases if b.startswith("/")])
+    return out
+
+
+def needles(m: Model) -> tuple[list[str], list[str]]:
+    """(exact path forms, loose name forms) a script might use to refer to m."""
+    if m.source == "ollama":
+        return [m.extra.get("name", m.name)], []
+    if m.is_dir:
+        base = os.path.basename(m.path)
+        loose = [base] if len(base) >= 8 and base.lower() not in GENERIC_DIR_NAMES \
+            and not QUANT_RE.match(base) else []
+        return [m.path], loose
+    first = os.path.basename(m.files[0])
+    sm = SHARD_RE.match(first)
+    name = sm["prefix"] + "-" if sm else first
+    return [os.path.join(os.path.dirname(m.files[0]), name)], [name]
+
+
+def service_refs(models: list[Model]) -> dict[str, list[str]]:
+    """key -> units that mention the model. A unit that names one copy by path
+    doesn't also count as using other copies that merely share its file name."""
+    refs = {m.key: [] for m in models}
+    forms = {m.key: needles(m) for m in models}
+    for unit, (text, bases) in unit_texts().items():
+        exact = set()
+        for m in models:
+            ex, _ = forms[m.key]
+            rel = [os.path.relpath(e, b) for e in ex for b in bases]
+            if any(e in text for e in ex) or any(not r.startswith("..") and r in text for r in rel):
+                exact.add(m.key)
+        claimed = {n for m in models if m.key in exact for n in forms[m.key][1]}
+        for m in models:
+            loose = forms[m.key][1]
+            if m.key in exact or (any(n in text for n in loose) and not set(loose) & claimed):
+                refs[m.key].append(unit)
+    return refs
+
+
+def unit_states(units: list[str]) -> dict[str, str]:
+    if not units:
+        return {}
+    try:
+        out = subprocess.run(["systemctl", "is-active", *units], capture_output=True,
+                             text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return dict(zip(units, out))
+
+
+def annotate(models: list[Model]) -> dict[str, tuple]:
+    """key -> (users, services, writable). Safe to run off the main thread."""
+    omap = open_weight_files()
+    refs = service_refs(models)
+    states = unit_states(sorted({u for us in refs.values() for u in us}))
+    out = {}
+    for m in models:
+        if m.source == "ollama":
+            store = m.extra.get("store", "")
+            writable = os.access(os.path.join(store, "blobs"), os.W_OK) or bool(shutil.which("ollama"))
+        else:
+            writable = os.access(os.path.dirname(m.path), os.W_OK) and \
+                (not m.is_dir or os.access(m.path, os.W_OK))
+        out[m.key] = (users_of(m, omap), [(u, states.get(u, "?")) for u in refs[m.key]], writable)
+    return out
+
+
+def model_bytes(models: list[Model]) -> int:
+    """Space the models occupy, counting blobs shared between Ollama tags once."""
+    total, blobs = 0, {}
+    for m in models:
+        if m.source == "ollama" and "sizes" in m.extra:
+            blobs.update(m.extra["sizes"])
+        else:
+            total += m.size
+    return total + sum(blobs.values())
+
+
+def mark_bulk(models: list[Model], window: float = 60, min_cluster: int = 4) -> None:
+    """Flag models whose last-use time is shared with several others: something
+    read them all at once (a backup, Ollama's startup scan), so atime only tells
+    us the real last use was no later than that."""
+    for m in models:
+        m.bulk = 0
+    ms = sorted((m for m in models if m.last_used), key=lambda m: m.last_used)
+    i = 0
+    while i < len(ms):
+        j = i
+        while j + 1 < len(ms) and ms[j + 1].last_used - ms[j].last_used <= window:
+            j += 1
+        if j - i + 1 >= min_cluster:
+            for m in ms[i:j + 1]:
+                m.bulk = j - i
+        i = j + 1
+
+
+def mark_dups(models: list[Model]) -> None:
+    by_sig = defaultdict(list)
+    for m in models:
+        if m.signature and m.source != "ollama":
+            by_sig[tuple(tuple(x) for x in m.signature)].append(m)
+    for m in models:
+        m.dups = []
+    for ms in by_sig.values():
+        if len(ms) > 1:
+            for m in ms:
+                m.dups = [o.path for o in ms if o is not m]
+
+
+# ─── cache / config ──────────────────────────────────────────────────────────
+
+def load_json(p: Path, default):
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(p: Path, data) -> None:
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def load_cache() -> tuple[list[Model], float] | None:
+    data = load_json(CACHE_FILE, None)
+    if not data or data.get("version") != CACHE_VERSION:
+        return None
+    try:
+        models = [Model.from_json(d) for d in data["models"]]
+    except (TypeError, KeyError):
+        return None
+    models = [m for m in models if os.path.lexists(m.path) and not os.path.islink(m.path)]
+    return models, data.get("scanned_at", 0)
+
+
+def save_cache(models: list[Model], scanned_at: float) -> None:
+    save_json(CACHE_FILE, {"version": CACHE_VERSION, "scanned_at": scanned_at,
+                           "models": [m.to_json() for m in models]})
+
+
+# ─── moving and deleting ─────────────────────────────────────────────────────
+
+class Cancelled(Exception):
+    pass
+
+
+def _fadvise(fd: int, off: int, n: int, advice: int) -> None:
+    try:
+        os.posix_fadvise(fd, off, n, advice)
+    except (OSError, AttributeError):
+        pass
+
+
+def copy_file(src: str, dst: str, progress, cancel: threading.Event) -> None:
+    """Copy one file without polluting the page cache; keeps mode and times."""
+    st = os.stat(src)
+    size = st.st_size
+    try:  # don't let our own read count as "use" if the move is cancelled
+        fdi = os.open(src, os.O_RDONLY | getattr(os, "O_NOATIME", 0))
+    except PermissionError:
+        fdi = os.open(src, os.O_RDONLY)
+    try:
+        fdo = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            _fadvise(fdi, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+            if size:
+                try:
+                    os.posix_fallocate(fdo, 0, size)
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:
+                        raise
+            off, unsynced, use_sendfile = 0, 0, True
+            while off < size:
+                if cancel.is_set():
+                    raise Cancelled()
+                n = min(CHUNK, size - off)
+                if use_sendfile:
+                    try:
+                        k = os.sendfile(fdo, fdi, off, n)
+                    except OSError as e:
+                        if e.errno not in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+                            raise
+                        use_sendfile = False
+                        continue
+                else:
+                    k = os.pwrite(fdo, os.pread(fdi, n, off), off)
+                if k <= 0:
+                    raise OSError(errno.EIO, f"short read from {src}")
+                off += k
+                unsynced += k
+                progress(k)
+                if unsynced >= SYNC_EVERY:
+                    os.fdatasync(fdo)
+                    _fadvise(fdo, 0, off, os.POSIX_FADV_DONTNEED)
+                    _fadvise(fdi, 0, off, os.POSIX_FADV_DONTNEED)
+                    unsynced = 0
+            os.fdatasync(fdo)
+            _fadvise(fdo, 0, 0, os.POSIX_FADV_DONTNEED)
+            _fadvise(fdi, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.fchmod(fdo, stat.S_IMODE(st.st_mode))
+        finally:
+            os.close(fdo)
+    finally:
+        os.close(fdi)
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    if os.path.getsize(dst) != size:
+        raise OSError(errno.EIO, f"size mismatch copying {src}")
+
+
+def copy_tree(src: str, dst: str, progress, cancel: threading.Event) -> None:
+    st = os.stat(src)
+    os.mkdir(dst, 0o700)
+    dir_meta = [(dst, st)]
+    for root, dirs, files in os.walk(src):
+        droot = os.path.join(dst, os.path.relpath(root, src))
+        for name in dirs + files:
+            s, t = os.path.join(root, name), os.path.join(droot, name)
+            lst = os.lstat(s)
+            if stat.S_ISLNK(lst.st_mode):
+                os.symlink(os.readlink(s), t)
+            elif stat.S_ISDIR(lst.st_mode):
+                os.mkdir(t, 0o700)
+                dir_meta.append((t, lst))
+            elif stat.S_ISREG(lst.st_mode):
+                copy_file(s, t, progress, cancel)
+    for d, s in reversed(dir_meta):
+        os.chmod(d, stat.S_IMODE(s.st_mode))
+        os.utime(d, ns=(s.st_atime_ns, s.st_mtime_ns))
+
+
+def tree_signature(p: str) -> tuple[int, int]:
+    if not os.path.isdir(p) or os.path.islink(p):
+        return 1, os.lstat(p).st_size
+    n, total = 0, 0
+    for root, dirs, files in os.walk(p):
+        for name in files:
+            lst = os.lstat(os.path.join(root, name))
+            n += 1
+            total += lst.st_size if stat.S_ISREG(lst.st_mode) else 0
+    return n, total
+
+
+def apparent_size(p: str) -> int:
+    return tree_signature(p)[1]
+
+
+def remove_path(p: str) -> None:
+    if os.path.islink(p) or not os.path.isdir(p):
+        os.unlink(p)
+    else:
+        shutil.rmtree(p)
+
+
+def fsync_dir(d: str) -> None:
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+@dataclass
+class MoveItem:
+    model: Model
+    pairs: list           # [(src, dst)]
+    same_fs: bool
+    nbytes: int           # bytes that must be copied (0 for a rename)
+    link_targets: dict    # symlink -> what it resolved to before the move
+
+
+def plan_moves(models: list[Model], dest: str, disks: list[Disk]):
+    """-> (items, skipped [(model, reason)], fatal error or None)"""
+    dest = os.path.abspath(os.path.expanduser(dest))
+    ddisk = disk_for_path(disks, dest)
+    if ddisk is None:
+        return [], [], f"Can't tell which disk {dest} is on."
+    anc = dest
+    while not os.path.exists(anc):
+        anc = os.path.dirname(anc)
+    if not os.path.isdir(anc):
+        return [], [], f"{anc} is not a folder."
+    if not os.access(anc, os.W_OK):
+        return [], [], f"No write permission on {anc}."
+    items, skipped, taken = [], [], set()
+    for m in models:
+        if m.source == "ollama":
+            skipped.append((m, "Ollama manages its own store (set OLLAMA_MODELS to relocate it)"))
+            continue
+        if m.users:
+            skipped.append((m, f"in use by {', '.join(m.users)}"))
+            continue
+        if not m.writable:
+            skipped.append((m, f"no write permission on {m.location}"))
+            continue
+        srcs = [m.path] if m.is_dir else list(m.files)
+        pairs = [(s, os.path.join(dest, os.path.basename(s))) for s in srcs]
+        if all(os.path.dirname(s) == dest for s in srcs):
+            skipped.append((m, "already in that folder"))
+            continue
+        if m.is_dir and (dest == m.path or dest.startswith(m.path + "/")):
+            skipped.append((m, "destination is inside the model's own folder"))
+            continue
+        clash = next((d for _, d in pairs if os.path.lexists(d) or d in taken), None)
+        if clash:
+            skipped.append((m, f"{short_path(clash)} already exists"))
+            continue
+        missing = next((s for s in srcs if not os.path.lexists(s)), None)
+        if missing:
+            skipped.append((m, f"{short_path(missing)} no longer exists — rescan"))
+            continue
+        taken.update(d for _, d in pairs)
+        same = m.dev == ddisk.dev
+        nbytes = 0 if same else sum(apparent_size(s) for s in srcs)
+        targets = {}
+        for link in m.links:
+            try:
+                targets[link] = os.path.realpath(link)
+            except OSError:
+                pass
+        items.append(MoveItem(m, pairs, same, nbytes, targets))
+    need = sum(i.nbytes for i in items)
+    if need and need > ddisk.free - FREE_MARGIN:
+        return items, skipped, (f"Not enough space on {ddisk.mount}: need {human(need)}, "
+                                f"{human(max(0, ddisk.free - FREE_MARGIN))} usable.")
+    return items, skipped, None
+
+
+def execute_move(it: MoveItem, leave_link: bool, progress, cancel: threading.Event) -> None:
+    dest_dir = os.path.dirname(it.pairs[0][1])
+    os.makedirs(dest_dir, exist_ok=True)
+    if it.same_fs:
+        done = []
+        try:
+            for src, dst in it.pairs:
+                if os.path.lexists(dst):
+                    raise FileExistsError(dst)
+                os.rename(src, dst)
+                done.append((src, dst))
+        except BaseException:
+            for src, dst in reversed(done):
+                try:
+                    os.rename(dst, src)
+                except OSError:
+                    pass
+            raise
+    else:
+        tmps, renamed = [], []
+        try:
+            for src, dst in it.pairs:
+                tmp = os.path.join(dest_dir, f".{os.path.basename(dst)}.model-space-partial")
+                if os.path.lexists(tmp):
+                    remove_path(tmp)
+                tmps.append(tmp)
+                if os.path.isdir(src) and not os.path.islink(src):
+                    copy_tree(src, tmp, progress, cancel)
+                else:
+                    copy_file(src, tmp, progress, cancel)
+            for (src, _), tmp in zip(it.pairs, tmps):
+                if tree_signature(src) != tree_signature(tmp):
+                    raise OSError(errno.EIO, f"verification failed for {src}")
+            if cancel.is_set():
+                raise Cancelled()
+            for (_, dst), tmp in zip(it.pairs, tmps):
+                if os.path.lexists(dst):
+                    raise FileExistsError(dst)
+                os.rename(tmp, dst)
+                renamed.append(dst)
+        except BaseException:
+            for p in tmps + renamed:
+                try:
+                    if os.path.lexists(p):
+                        remove_path(p)
+                except OSError:
+                    pass
+            raise
+        fsync_dir(dest_dir)
+        for src, _ in it.pairs:
+            remove_path(src)
+    if leave_link:
+        for src, dst in it.pairs:
+            os.symlink(dst, src)
+    for link, old in it.link_targets.items():
+        new = map_moved(old, it.pairs)
+        if new != old and os.path.islink(link):
+            tmp = link + ".model-space-tmp"
+            try:
+                os.symlink(new, tmp)
+                os.replace(tmp, link)
+            except OSError:
+                pass
+
+
+def map_moved(p: str, pairs) -> str:
+    for s, d in pairs:
+        if p == s:
+            return d
+        if p.startswith(s + "/"):
+            return d + p[len(s):]
+    return p
+
+
+def guard_delete(m: Model, protected: set) -> None:
+    p = os.path.normpath(m.path)
+    if not os.path.isabs(p) or p in protected or p.count("/") < 2:
+        raise PermissionError(f"refusing to delete protected path {p}")
+    if os.path.islink(p):
+        raise PermissionError(f"{p} is now a symlink — rescan first")
+
+
+def ollama_delete(m: Model) -> None:
+    store, manifest = m.extra["store"], m.extra["manifest"]
+    if os.access(os.path.dirname(manifest), os.W_OK) and os.access(os.path.join(store, "blobs"), os.W_OK):
+        os.unlink(manifest)
+        still = {d for ds in ollama_manifests(store).values() for d in ds}
+        for b in m.files:
+            if os.path.basename(b).replace("-", ":", 1) not in still:
+                try:
+                    os.unlink(b)
+                except FileNotFoundError:
+                    pass
+        return
+    exe = shutil.which("ollama")
+    if not exe:
+        raise PermissionError(f"{store} isn't writable and the ollama CLI wasn't found")
+    r = subprocess.run([exe, "rm", m.extra["name"]], capture_output=True, text=True, timeout=120)
+    if r.returncode != 0 or os.path.exists(manifest):
+        msg = (r.stderr or r.stdout).strip() or "manifest still present"
+        raise RuntimeError(f"ollama rm failed: {msg} (is the Ollama server for this store running?)")
+
+
+def execute_delete(m: Model, protected: set) -> None:
+    if m.source == "ollama":
+        ollama_delete(m)
+    elif m.is_dir:
+        guard_delete(m, protected)
+        shutil.rmtree(m.path)
+    else:
+        guard_delete(m, protected)
+        for f in m.files:
+            try:
+                os.unlink(f)
+            except FileNotFoundError:
+                pass
+    for link in m.links:  # links that now dangle
+        if os.path.islink(link) and not os.path.exists(link):
+            try:
+                os.unlink(link)
+            except OSError:
+                pass
+
+
+# ─── widgets ─────────────────────────────────────────────────────────────────
+
+class StackBar(Widget):
+    """A stacked horizontal bar that fills its width."""
+
+    DEFAULT_CSS = "StackBar { height: 1; }"
+
+    def __init__(self, rows: int = 1, **kw):
+        super().__init__(**kw)
+        self.rows = rows
+        self.segments: list = []
+        self.total = 1.0
+        self.styles.height = rows
+
+    def set(self, segments, total) -> None:
+        self.segments, self.total = segments, total
+        self.refresh()
+
+    def render(self) -> Text:
+        line = bar_text(self.size.width, self.segments, self.total)
+        out = Text()
+        for i in range(self.rows):
+            if i:
+                out.append("\n")
+            out.append_text(line)
+        return out
+
+
+def legend(p, items) -> Text:
+    t = Text()
+    for i, (label, value, style) in enumerate(items):
+        if i:
+            t.append("    ")
+        t.append("■ ", style=style)
+        t.append(f"{label} ", style=p.muted)
+        t.append(human(value), style=f"bold {p.fg}")
+    return t
+
+
+class DiskCard(Vertical):
+    def __init__(self, disk: Disk):
+        super().__init__()
+        self.disk = disk
+
+    def compose(self) -> ComposeResult:
+        yield Static(classes="card-sub")
+        yield StackBar(rows=2, classes="card-bar")
+        yield Static(classes="card-legend")
+        yield Static(classes="card-models")
+
+    def set_data(self, disk: Disk, models: list[Model]) -> None:
+        self.disk = disk
+        p = palette(self.app)
+        frac = disk.frac
+        msize = min(model_bytes(models), disk.used)
+        self.border_title = f" {disk.mount} "
+        self.border_subtitle = f" {frac * 100:.0f}% used · {human(disk.free)} free "
+        self.set_class(frac >= 0.9, "crit")
+        self.set_class(0.75 <= frac < 0.9, "warn")
+        self.query_one(".card-sub", Static).update(
+            Text(f"{disk.device} · {disk.fstype}" + (f" · {disk.label}" if disk.label else ""),
+                 style=p.muted, no_wrap=True, overflow="ellipsis"))
+        self.query_one(StackBar).set(
+            [(msize, p.accent, "█"), (disk.used - msize, p.secondary, "█"), (disk.free, p.track, "░")],
+            disk.used + disk.free)
+        self.query_one(".card-legend", Static).update(legend(p, [
+            ("models", msize, p.accent), ("other", disk.used - msize, p.secondary),
+            ("free", disk.free, p.track), ("size", disk.total, p.muted)]))
+        t = Text(no_wrap=True, overflow="ellipsis")
+        if models:
+            t.append(f"{len(models)} models", style=f"bold {p.accent}")
+            t.append(" · largest:", style=p.muted)
+            for m in sorted(models, key=lambda m: -m.size)[:4]:
+                t.append(f"\n{human(m.size):>10}  ", style=f"bold {p.fg}")
+                t.append(m.name, style=p.fg)
+                t.append(f"  {ago(m.last_used)}", style=age_style(p, m.last_used))
+        else:
+            t.append("no models found here", style=p.muted)
+        self.query_one(".card-models", Static).update(t)
+
+
+class StorageView(VerticalScroll):
+    def compose(self) -> ComposeResult:
+        with Vertical(id="overview"):
+            yield Static(id="overview-head")
+            yield StackBar(rows=1, id="overview-bar")
+            yield Static(id="overview-legend")
+            yield Static(id="overview-alerts")
+        yield Vertical(id="cards")
+
+    def on_resize(self) -> None:
+        self.query_one("#cards").styles.grid_size_columns = 2 if self.size.width >= 130 else 1
+
+    def refresh_data(self, disks: list[Disk], models: list[Model], scanning: bool) -> None:
+        p = palette(self.app)
+        cards = self.query_one("#cards")
+        existing = {c.disk.dev: c for c in cards.query(DiskCard)}
+        if set(existing) != {d.dev for d in disks}:
+            cards.remove_children()
+            existing = {d.dev: DiskCard(d) for d in disks}
+            cards.mount(*existing.values())
+            self.call_after_refresh(self.refresh_data, disks, models, scanning)
+            return
+        for d in disks:
+            existing[d.dev].set_data(d, [m for m in models if m.dev == d.dev])
+
+        used = sum(d.used for d in disks)
+        free = sum(d.free for d in disks)
+        msize = min(model_bytes([m for m in models if any(m.dev == d.dev for d in disks)]), used)
+        self.query_one("#overview").border_title = " All storage "
+        head = Text()
+        head.append(human(used + free), style=f"bold {p.fg}")
+        head.append(f" across {len(disks)} filesystems   ", style=p.muted)
+        head.append(f"{used / ((used + free) or 1) * 100:.0f}% used", style=f"bold {level_style(p, used / ((used + free) or 1))}")
+        head.append("   ·   ", style=p.muted)
+        head.append(f"{len(models)} models", style=f"bold {p.accent}")
+        head.append(f" taking {human(msize)}", style=p.fg)
+        if scanning:
+            head.append("   (scanning…)", style=f"italic {p.muted}")
+        self.query_one("#overview-head", Static).update(head)
+        self.query_one("#overview-bar", StackBar).set(
+            [(msize, p.accent, "█"), (used - msize, p.secondary, "█"), (free, p.track, "░")], used + free)
+        self.query_one("#overview-legend", Static).update(legend(p, [
+            ("models", msize, p.accent), ("other", used - msize, p.secondary), ("free", free, p.track)]))
+        alerts = Text()
+        for d in disks:
+            if d.frac >= 0.9:
+                if alerts:
+                    alerts.append("\n")
+                alerts.append("▲ ", style=p.err)
+                alerts.append(f"{d.mount} is {d.frac * 100:.0f}% full", style=f"bold {p.err}")
+                alerts.append(f" — {human(d.free)} left. ", style=p.fg)
+                alerts.append("2 moves models off it, 3 cleans up old ones.", style=p.muted)
+        self.query_one("#overview-alerts", Static).update(alerts)
+        self.query_one("#overview-alerts").display = bool(alerts)
+
+
+class ModelList(Vertical):
+    """Filter bar, model table and details pane; subclasses add columns and actions."""
+
+    BINDINGS = [
+        Binding("space", "toggle_row", "Select"),
+        Binding("a", "select_all", "All"),
+        Binding("n", "select_none", "None"),
+        Binding("slash", "focus_filter", "Filter"),
+    ]
+    COLUMNS: list = []
+    sort_by = "size"
+    sort_reverse = True
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.selected: set[str] = set()
+        self.rows: list[Model] = []
+        self.disk_filter = "*"
+        self.text_filter = ""
+
+    # subclass hooks
+    def compose_filters(self) -> ComposeResult:
+        yield from ()
+
+    def compose_side(self) -> ComposeResult:
+        yield from ()
+
+    def compose_bottom(self) -> ComposeResult:
+        yield from ()
+
+    def extra_visible(self, m: Model) -> bool:
+        return True
+
+    def cells(self, m: Model, p) -> list:
+        raise NotImplementedError
+
+    def summary_changed(self) -> None:
+        pass
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="body"):
+            with Vertical(classes="main"):
+                with Horizontal(classes="filters"):
+                    yield Input(placeholder="Filter by name or path…   ( / )", classes="filter")
+                    yield Select([("All disks", "*")], value="*", allow_blank=False, classes="disk-filter")
+                    yield from self.compose_filters()
+                yield DataTable(cursor_type="row", zebra_stripes=True)
+                yield Static(classes="details")
+                yield from self.compose_bottom()
+            yield from self.compose_side()
+
+    def on_mount(self) -> None:
+        t = self.query_one(DataTable)
+        for label, key, width in self.COLUMNS:
+            t.add_column(label, key=key, width=width)
+
+    @property
+    def table(self) -> DataTable:
+        return self.query_one(DataTable)
+
+    def sort_value(self, m: Model):
+        return {"size": m.size, "name": m.name.lower(), "used": m.last_used, "idle": -m.last_used,
+                "disk": self.app.mount_of(m), "loc": m.path, "fmt": m.format_label,
+                "flags": (bool(m.users), bool(m.services), bool(m.dups))}.get(self.sort_by, m.size)
+
+    def matches(self, m: Model) -> bool:
+        if self.disk_filter != "*" and str(m.dev) != self.disk_filter:
+            return False
+        if self.text_filter:
+            hay = f"{m.name} {m.path} {m.format_label}".lower()
+            if not all(w in hay for w in self.text_filter.lower().split()):
+                return False
+        return self.extra_visible(m)
+
+    def set_disks(self, disks: list[Disk]) -> None:
+        sel = self.query_one(".disk-filter", Select)
+        opts = [("All disks", "*")] + [(d.mount, str(d.dev)) for d in disks]
+        value = self.disk_filter if any(v == self.disk_filter for _, v in opts) else "*"
+        with sel.prevent(Select.Changed):
+            sel.set_options(opts)
+            sel.value = value
+        self.disk_filter = value
+
+    def current(self) -> Model | None:
+        t = self.table
+        if not self.rows or t.cursor_row is None or t.cursor_row >= len(self.rows):
+            return None
+        return self.rows[t.cursor_row]
+
+    def rebuild(self) -> None:
+        t = self.table
+        cur = self.current()
+        cur_key = cur.key if cur else None
+        p = palette(self.app)
+        keys = {m.key for m in self.app.models}
+        self.selected &= keys
+        self.rows = sorted((m for m in self.app.models if self.matches(m)),
+                           key=self.sort_value, reverse=self.sort_reverse)
+        t.clear()
+        for m in self.rows:
+            t.add_row(*self.cells(m, p), key=m.key)
+        if cur_key:
+            idx = next((i for i, m in enumerate(self.rows) if m.key == cur_key), None)
+            if idx is not None:
+                t.move_cursor(row=idx, animate=False)
+        self.show_details()
+        self.summary_changed()
+
+    def redraw_row(self, m: Model) -> None:
+        p = palette(self.app)
+        for (_, key, _), value in zip(self.COLUMNS, self.cells(m, p)):
+            self.table.update_cell(m.key, key, value)
+
+    def styled(self, m: Model, value, style: str = "") -> Text:
+        t = value if isinstance(value, Text) else Text(str(value), style=style)
+        if m.key in self.selected:
+            t.stylize("bold")
+        return t
+
+    def mark(self, m: Model, p) -> Text:
+        return Text("✔", style=f"bold {p.accent}") if m.key in self.selected else Text("·", style=p.muted)
+
+    def flags(self, m: Model, p) -> Text:
+        t = Text()
+        if m.users:
+            t.append("● in use ", style=f"bold {p.err}")
+        if m.services:
+            active = any(s == "active" for _, s in m.services)
+            t.append("svc ", style=f"bold {p.warn}" if active else p.warn)
+        if m.dups:
+            t.append("dup ", style=p.primary)
+        if m.links:
+            t.append("↩link ", style=p.secondary)
+        if not m.writable:
+            t.append("ro ", style=p.muted)
+        if m.kind == "partial":
+            t.append("partial ", style=p.warn)
+        return t
+
+    def show_details(self) -> None:
+        m = self.current()
+        box = self.query_one(".details", Static)
+        if m is None:
+            box.update(Text("No models match.", style=palette(self.app).muted))
+            return
+        p = palette(self.app)
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append(m.name, style=f"bold {p.fg}")
+        t.append(f"   {m.format_label} · {m.nfiles} file{'s' * (m.nfiles != 1)} · {human(m.size)}", style=p.fg)
+        if m.frees != m.size:
+            t.append(f" (deleting frees {human(m.frees)})", style=p.muted)
+        t.append("\n")
+        t.append(short_path(m.path) + ("/" if m.is_dir else ""), style=p.secondary)
+        if m.is_dir:
+            t.append("  (whole folder)", style=p.muted)
+        elif m.nfiles > 1:
+            t.append(f"  + {m.nfiles - 1} more part{'s' * (m.nfiles > 2)}", style=p.muted)
+        t.append("\n")
+        t.append("last used ", style=p.muted)
+        t.append(time.strftime("%Y-%m-%d %H:%M", time.localtime(m.last_used)) if m.last_used else "never",
+                 style=age_style(p, m.last_used))
+        t.append(f" ({ago(m.last_used)})", style=p.muted)
+        if m.bulk:
+            t.append(f"  * read together with {m.bulk} other models then (a backup or scan?) — "
+                     "real last use was no later", style=p.muted)
+        t.append("   modified ", style=p.muted)
+        t.append(time.strftime("%Y-%m-%d", time.localtime(m.mtime)), style=p.fg)
+        notes = []
+        if m.users:
+            notes.append((f"● open by {', '.join(m.users)}", p.err))
+        for u, s in m.services:
+            notes.append((f"referenced by {u} ({s})", p.warn))
+        for d in m.dups:
+            notes.append((f"copy also at {short_path(d)}", p.primary))
+        for link in m.links[:3]:
+            notes.append((f"symlink {short_path(link)}", p.secondary))
+        if not m.writable:
+            notes.append(("read-only for you", p.muted))
+        if notes:
+            t.append("\n")
+            for i, (s, style) in enumerate(notes):
+                if i:
+                    t.append("  ·  ", style=p.muted)
+                t.append(s, style=style)
+        box.update(t)
+
+    def targets(self) -> list[Model]:
+        if self.selected:
+            return [m for m in self.app.models if m.key in self.selected]
+        cur = self.current()
+        return [cur] if cur else []
+
+    # events / actions
+    @on(DataTable.RowHighlighted)
+    def _highlighted(self) -> None:
+        self.show_details()
+
+    @on(DataTable.RowSelected)
+    def _row_selected(self) -> None:
+        self.action_toggle_row()
+
+    @on(DataTable.HeaderSelected)
+    def _header(self, event: DataTable.HeaderSelected) -> None:
+        key = event.column_key.value
+        if key == "mark":
+            return
+        if key == self.sort_by:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_by, self.sort_reverse = key, key in ("size", "used", "flags")
+        self.rebuild()
+
+    @on(Input.Changed, ".filter")
+    def _filter(self, event: Input.Changed) -> None:
+        self.text_filter = event.value
+        self.rebuild()
+
+    @on(Input.Submitted, ".filter")
+    def _filter_done(self) -> None:
+        self.table.focus()
+
+    @on(Select.Changed, ".disk-filter")
+    def _disk(self, event: Select.Changed) -> None:
+        self.disk_filter = str(event.value)
+        self.rebuild()
+
+    def action_toggle_row(self) -> None:
+        m = self.current()
+        if m is None:
+            return
+        self.selected ^= {m.key}
+        self.redraw_row(m)
+        t = self.table
+        if t.cursor_row < len(self.rows) - 1:
+            t.move_cursor(row=t.cursor_row + 1)
+        self.summary_changed()
+
+    def action_select_all(self) -> None:
+        self.selected |= {m.key for m in self.rows}
+        self.rebuild()
+
+    def action_select_none(self) -> None:
+        self.selected.clear()
+        self.rebuild()
+
+    def action_focus_filter(self) -> None:
+        self.query_one(".filter", Input).focus()
+
+
+class MoveView(ModelList):
+    BINDINGS = [Binding("m", "move", "Move selected")]
+    _programmatic_hl: str | None = None
+    COLUMNS = [("", "mark", 1), ("Model", "name", 44), ("Format", "fmt", 15), ("Size", "size", 9),
+               ("Disk", "disk", 11), ("Location", "loc", 32), ("Last used", "used", 10),
+               ("Flags", "flags", 16)]
+
+    def compose_side(self) -> ComposeResult:
+        with Vertical(id="move-side"):
+            yield Label("Destination disk", classes="side-title")
+            yield OptionList(id="dest-disks")
+            yield Label("Folder", classes="side-title")
+            with Horizontal(id="dest-row"):
+                yield Input(id="dest-path", placeholder="/path/to/folder")
+                yield Button("…", id="browse", tooltip="Browse for a folder")
+            yield Checkbox("Leave a symlink at the old location", value=True, id="leave-link")
+            yield Static(id="move-summary")
+            yield Button("Move selected  ▶", id="do-move", variant="primary")
+
+    def cells(self, m: Model, p) -> list:
+        return [self.mark(m, p),
+                self.styled(m, Text(m.name, style=p.fg, overflow="ellipsis", no_wrap=True)),
+                self.styled(m, m.format_label, p.muted),
+                self.styled(m, Text(human(m.size), style=f"bold {p.fg}", justify="right")),
+                self.styled(m, self.app.mount_of(m), p.secondary),
+                self.styled(m, short_path(m.location, 32), p.muted),
+                self.styled(m, used_label(m), age_style(p, m.last_used)),
+                self.flags(m, p)]
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self.refresh_dest_disks)
+
+    def dest_disk(self) -> Disk | None:
+        path = self.query_one("#dest-path", Input).value.strip()
+        return disk_for_path(self.app.disks, os.path.expanduser(path)) if path else None
+
+    def suggest_dest(self, d: Disk) -> str:
+        saved = self.app.config.get("dest", {}).get(d.mount)
+        if saved:
+            return saved
+        return os.path.join(HOME, "models") if d.mount == "/" else d.mount
+
+    def refresh_dest_disks(self) -> None:
+        ol = self.query_one("#dest-disks", OptionList)
+        p = palette(self.app)
+        sel = self.targets() if self.selected else []
+        width = ol.scrollable_content_region.width - 2 if ol.size.width else 38
+        width = max(20, width)
+        opts = []
+        for d in self.app.disks:
+            if d.mount in NO_SCAN_MOUNTS:
+                continue
+            incoming = sum(m.size for m in sel if m.dev != d.dev and m.source != "ollama")
+            fits = d.free - incoming > FREE_MARGIN
+            t = Text(no_wrap=True, overflow="ellipsis")
+            free_s = f"{human(d.free)} free"
+            t.append(f"{d.mount:<{max(1, width - len(free_s))}}", style=f"bold {p.fg}")
+            t.append(free_s, style=level_style(p, d.frac))
+            t.append("\n")
+            t.append_text(bar_text(width, [(d.used, p.secondary, "━"),
+                                           (min(incoming, d.free), p.accent if fits else p.err, "━"),
+                                           (max(0, d.free - incoming), p.track, "━")], d.used + d.free))
+            if incoming:
+                t.append("\n")
+                t.append("after move  ", style=p.muted)
+                if fits:
+                    after = (d.used + incoming) / (d.used + d.free)
+                    t.append(f"{human(d.free - incoming)} free · {after * 100:.0f}% used",
+                             style=level_style(p, after))
+                else:
+                    t.append(f"won't fit — {human(incoming - d.free + FREE_MARGIN)} short", style=f"bold {p.err}")
+            opts.append(Option(t, id=str(d.dev)))
+        hi = ol.highlighted
+        path_input = self.query_one("#dest-path", Input)
+        cur = self.dest_disk()
+        ol.clear_options()
+        ol.add_options(opts)
+        if not opts:
+            return
+        # Keep the highlight on the disk the folder is on; rebuilding the list
+        # must never rewrite a folder the user typed.
+        ids = [o.id for o in opts]
+        idx = ids.index(str(cur.dev)) if cur and str(cur.dev) in ids else \
+            hi if hi is not None and hi < len(opts) else 0
+        self._programmatic_hl = ids[idx]
+        ol.highlighted = idx
+        if not path_input.value.strip():
+            d = next(d for d in self.app.disks if str(d.dev) == ids[idx])
+            path_input.value = self.suggest_dest(d)
+
+    @on(OptionList.OptionHighlighted, "#dest-disks")
+    def _dest_disk(self, event: OptionList.OptionHighlighted) -> None:
+        if event.option.id == self._programmatic_hl:
+            self._programmatic_hl = None
+            return  # our own re-highlight after a rebuild, not the user picking a disk
+        d = next((d for d in self.app.disks if str(d.dev) == event.option.id), None)
+        cur = self.dest_disk()
+        if d and (cur is None or cur.dev != d.dev):
+            self.query_one("#dest-path", Input).value = self.suggest_dest(d)
+
+    @on(Input.Changed, "#dest-path")
+    def _dest_changed(self) -> None:
+        self.summary_changed()
+
+    @on(Checkbox.Changed, "#leave-link")
+    def _link_changed(self) -> None:
+        self.summary_changed()
+
+    def summary_changed(self) -> None:
+        self.refresh_dest_disks()
+        p = palette(self.app)
+        sel = self.targets() if self.selected else []
+        box = self.query_one("#move-summary", Static)
+        t = Text()
+        if not sel:
+            t.append("Select models with space, then pick a disk and folder.", style=p.muted)
+            box.update(t)
+            return
+        d = self.dest_disk()
+        t.append(f"{len(sel)} selected · {human(sum(m.size for m in sel))}\n", style=f"bold {p.fg}")
+        if d is None:
+            t.append("Pick a destination.", style=p.warn)
+            box.update(t)
+            return
+        rename = [m for m in sel if m.dev == d.dev]
+        copy = [m for m in sel if m.dev != d.dev and m.source != "ollama"]
+        if copy:
+            t.append(f"copy {human(sum(m.size for m in copy))} → {d.mount}\n", style=p.accent)
+        if rename:
+            t.append(f"{len(rename)} on the same disk (instant rename)\n", style=p.ok)
+        blocked = [m for m in sel if m.users or m.source == "ollama" or not m.writable]
+        if blocked:
+            t.append(f"{len(blocked)} will be skipped (in use / Ollama / read-only)\n", style=p.warn)
+        svc = [m for m in sel if m.services]
+        if svc and not self.query_one("#leave-link", Checkbox).value:
+            t.append(f"⚠ {len(svc)} referenced by systemd units — keep the symlink on", style=p.err)
+        box.update(t)
+
+    @on(Button.Pressed, "#browse")
+    def _browse(self) -> None:
+        d = self.dest_disk() or (self.app.disks[0] if self.app.disks else None)
+        start = self.query_one("#dest-path", Input).value.strip() or (d.mount if d else "/")
+        while start and not os.path.isdir(start):
+            start = os.path.dirname(start)
+        root = d.mount if d and d.mount != "/" else HOME if start.startswith(HOME) else "/"
+
+        def chosen(path: str | None) -> None:
+            if path:
+                self.query_one("#dest-path", Input).value = path
+        self.app.push_screen(DirPicker(root), chosen)
+
+    @on(Button.Pressed, "#do-move")
+    def _do_move(self) -> None:
+        self.action_move()
+
+    def action_move(self) -> None:
+        models = self.targets()
+        if not models:
+            self.app.notify("Nothing selected.", severity="warning")
+            return
+        dest = self.query_one("#dest-path", Input).value.strip()
+        if not dest:
+            self.app.notify("Pick a destination folder first.", severity="warning")
+            return
+        self.app.confirm_move(models, dest, self.query_one("#leave-link", Checkbox).value)
+
+
+class CleanupView(ModelList):
+    BINDINGS = [Binding("d", "delete", "Delete selected"), Binding("delete", "delete", show=False)]
+    COLUMNS = [("", "mark", 1), ("Last used", "used", 10), ("Idle", "idle", 14), ("Model", "name", 44),
+               ("Size", "size", 9), ("Disk", "disk", 11), ("Location", "loc", 30), ("Flags", "flags", 16)]
+    sort_by = "used"
+    sort_reverse = False
+    AGES = [("Any age", 0), ("Idle ≥ 7 days", 7), ("Idle ≥ 30 days", 30), ("Idle ≥ 90 days", 90),
+            ("Idle ≥ 180 days", 180), ("Idle ≥ 1 year", 365)]
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.min_age = 0
+
+    def compose_filters(self) -> ComposeResult:
+        yield Select(self.AGES, value=0, allow_blank=False, id="age-filter")
+        yield Input(placeholder="GiB", id="free-target", type="number")
+        yield Button("Pick oldest", id="pick-oldest", tooltip="Select the longest-unused models until this much is freed")
+
+    def compose_bottom(self) -> ComposeResult:
+        with Horizontal(id="clean-bar"):
+            yield Static(id="clean-summary")
+            yield Button("Delete selected", id="do-delete", variant="error")
+
+    def extra_visible(self, m: Model) -> bool:
+        return days_since(m.last_used) >= self.min_age
+
+    def cells(self, m: Model, p) -> list:
+        oldest = max((days_since(r.last_used) for r in self.app.models), default=1) or 1
+        days = days_since(m.last_used)
+        style = age_style(p, m.last_used)
+        idle = bar_text(8, [(days, style, "▇"), (oldest - days, p.track, "▁")], oldest)
+        idle.append(f" {int(days):>4}d" if days < 1e8 else "   ?", style=style)
+        return [self.mark(m, p),
+                self.styled(m, used_label(m), style),
+                idle,
+                self.styled(m, Text(m.name, style=p.fg, overflow="ellipsis", no_wrap=True)),
+                self.styled(m, Text(human(m.size), style=f"bold {p.fg}", justify="right")),
+                self.styled(m, self.app.mount_of(m), p.secondary),
+                self.styled(m, short_path(m.location, 30), p.muted),
+                self.flags(m, p)]
+
+    @on(Select.Changed, "#age-filter")
+    def _age(self, event: Select.Changed) -> None:
+        self.min_age = int(event.value)
+        self.rebuild()
+
+    def summary_changed(self) -> None:
+        p = palette(self.app)
+        sel = [m for m in self.app.models if m.key in self.selected]
+        t = Text()
+        if not sel:
+            t.append("Select models with space — or type a size and press ", style=p.muted)
+            t.append("Pick oldest", style=f"bold {p.fg}")
+            t.append(" to select the longest-unused ones.", style=p.muted)
+        else:
+            t.append(f"{len(sel)} selected · frees {human(sum(m.frees for m in sel))}", style=f"bold {p.fg}")
+            by_disk = Counter()
+            for m in sel:
+                by_disk[m.dev] += m.frees
+            for d in self.app.disks:
+                if by_disk[d.dev]:
+                    t.append(f"   {d.mount} ", style=p.secondary)
+                    t.append(f"{human(d.free)} → {human(d.free + by_disk[d.dev])} free", style=p.ok)
+            risky = [m for m in sel if m.users or m.services]
+            if risky:
+                t.append(f"   ⚠ {len(risky)} in use or referenced by a service", style=p.warn)
+        self.query_one("#clean-summary", Static).update(t)
+
+    @on(Button.Pressed, "#pick-oldest")
+    @on(Input.Submitted, "#free-target")
+    def _pick_oldest(self) -> None:
+        raw = self.query_one("#free-target", Input).value.strip()
+        try:
+            target = float(raw) * (1 << 30)
+        except ValueError:
+            self.app.notify("Type how many GiB to free first.", severity="warning")
+            return
+        self.selected.clear()
+        got = 0
+        for m in sorted(self.rows, key=lambda m: m.last_used):
+            if got >= target:
+                break
+            if m.users or m.services or not m.writable:
+                continue
+            self.selected.add(m.key)
+            got += m.frees
+        self.rebuild()
+        scope = "" if self.disk_filter == "*" else f" on {next((d.mount for d in self.app.disks if str(d.dev) == self.disk_filter), '?')}"
+        msg = f"Selected {len(self.selected)} models{scope}, freeing {human(got)}"
+        if got < target:
+            msg += f" — that's all that's safely deletable here (in-use and service-referenced models are skipped)"
+        self.app.notify(msg)
+        self.table.focus()
+
+    @on(Button.Pressed, "#do-delete")
+    def _do_delete(self) -> None:
+        self.action_delete()
+
+    def action_delete(self) -> None:
+        models = self.targets()
+        if not models:
+            self.app.notify("Nothing selected.", severity="warning")
+            return
+        self.app.confirm_delete(models)
+
+
+# ─── modal screens ───────────────────────────────────────────────────────────
+
+class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, body: Text, confirm: str, variant: str = "primary", can_confirm=True):
+        super().__init__()
+        self.title_text, self.body, self.confirm, self.variant = title, body, confirm, variant
+        self.can_confirm = can_confirm
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self.title_text, id="dialog-title")
+            with VerticalScroll(id="dialog-body"):
+                yield Static(self.body)
+            with Horizontal(id="dialog-buttons"):
+                yield Button("Cancel", id="cancel")
+                if self.can_confirm:
+                    yield Button(self.confirm, id="ok", variant=self.variant)
+
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
+    @on(Button.Pressed, "#ok")
+    def _ok(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class OpScreen(ModalScreen[None]):
+    """Progress for a running move/delete."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, title: str, total: int, cancel: threading.Event):
+        super().__init__()
+        self.title_text, self.total, self.cancel = title, max(1, total), cancel
+        self.done_bytes = 0
+        self.started = time.monotonic()
+        self.finished = False
+        self.samples: list[tuple[float, int]] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="op"):
+            yield Label(self.title_text, id="op-title")
+            yield Static(id="op-current")
+            yield ProgressBar(total=self.total, show_eta=False, id="op-bar")
+            yield Static(id="op-stats")
+            yield RichLog(id="op-log", wrap=True, markup=False)
+            with Horizontal(id="op-buttons"):
+                yield Button("Cancel", id="op-cancel", variant="warning")
+
+    def set_current(self, text: str) -> None:
+        self.query_one("#op-current", Static).update(Text(text, style="bold", no_wrap=True, overflow="ellipsis"))
+
+    def advance(self, n: int) -> None:
+        self.done_bytes += n
+        self.query_one(ProgressBar).update(progress=self.done_bytes)
+        now = time.monotonic()
+        self.samples.append((now, self.done_bytes))
+        self.samples = [s for s in self.samples if now - s[0] < 5]
+        rate = 0.0
+        if len(self.samples) > 1 and self.samples[-1][0] > self.samples[0][0]:
+            rate = (self.samples[-1][1] - self.samples[0][1]) / (self.samples[-1][0] - self.samples[0][0])
+        eta = (self.total - self.done_bytes) / rate if rate > 0 else 0
+        p = palette(self.app)
+        t = Text()
+        t.append(f"{human(self.done_bytes)} / {human(self.total)}", style=f"bold {p.fg}")
+        if rate:
+            t.append(f"   {human(rate)}/s", style=p.accent)
+            t.append(f"   {int(eta // 60)}m {int(eta % 60):02d}s left", style=p.muted)
+        self.query_one("#op-stats", Static).update(t)
+
+    def log_line(self, text: str, kind: str = "") -> None:
+        p = palette(self.app)
+        style = {"ok": p.ok, "err": p.err, "warn": p.warn}.get(kind, p.fg)
+        self.query_one(RichLog).write(Text(text, style=style))
+
+    def finish(self, summary: str) -> None:
+        self.finished = True
+        self.set_current(summary)
+        b = self.query_one("#op-cancel", Button)
+        b.label, b.variant = "Close", "primary"
+        b.focus()
+
+    @on(Button.Pressed, "#op-cancel")
+    def action_cancel(self) -> None:
+        if self.finished:
+            self.dismiss(None)
+        elif not self.cancel.is_set():
+            self.cancel.set()
+            self.log_line("Cancelling — finishing the current chunk and cleaning up…", "warn")
+
+
+class DirsOnly(DirectoryTree):
+    def filter_paths(self, paths):
+        out = []
+        for p in paths:
+            try:
+                if p.is_dir() and not p.name.startswith("."):
+                    out.append(p)
+            except OSError:
+                pass
+        return out
+
+
+class DirPicker(ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, root: str):
+        super().__init__()
+        self.root = root
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Label(f"Choose a folder under {self.root}", id="picker-title")
+            yield DirsOnly(self.root, id="picker-tree")
+            with Horizontal(id="picker-buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Use this folder", id="use", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one(DirsOnly).focus()
+
+    @on(Button.Pressed, "#use")
+    def _use(self) -> None:
+        node = self.query_one(DirsOnly).cursor_node
+        self.dismiss(str(node.data.path) if node and node.data else self.root)
+
+    @on(Button.Pressed, "#cancel")
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ─── app ─────────────────────────────────────────────────────────────────────
+
+CSS = """
+Screen { background: $background; }
+#tabs { height: 1fr; }
+TabPane { padding: 0 1; }
+#status { height: 1; padding: 0 1; background: $panel; color: $foreground; }
+
+StorageView { padding: 0 1; }
+#overview { height: auto; border: round $primary; border-title-color: $primary;
+            border-title-style: bold; padding: 0 1; margin-top: 1; }
+#overview-bar { margin: 1 0 0 0; }
+#overview-alerts { margin-top: 1; }
+#cards { height: auto; layout: grid; grid-size: 2; grid-gutter: 0 2; grid-rows: auto; margin-top: 1; }
+DiskCard { height: auto; border: round $secondary; border-title-color: $foreground;
+           border-title-style: bold; border-subtitle-color: $success; padding: 0 1; margin-bottom: 1; }
+DiskCard.warn { border: round $warning; border-subtitle-color: $warning; }
+DiskCard.crit { border: round $error; border-subtitle-color: $error; }
+.card-bar { margin: 1 0 0 0; }
+.card-models { margin-top: 1; }
+
+ModelList { height: 1fr; }
+ModelList .body { height: 1fr; }
+ModelList .main { width: 1fr; }
+ModelList .filters { height: auto; margin-top: 1; }
+ModelList .filters Input.filter { width: 1fr; }
+ModelList .filters Select { width: 22; margin-left: 1; }
+ModelList DataTable { height: 1fr; border: round $panel-lighten-1; }
+ModelList DataTable:focus { border: round $primary; }
+ModelList .details { height: 6; border: round $panel; padding: 0 1; }
+
+#move-side { width: 46; height: 1fr; margin: 1 0 0 1; border: round $panel; padding: 0 1; }
+#move-side .side-title { margin-top: 1; color: $primary; text-style: bold; }
+#dest-disks { height: auto; border: none; padding: 0; background: $surface; }
+#dest-row { height: auto; }
+#dest-path { width: 1fr; }
+#browse { min-width: 5; width: 5; }
+#leave-link { margin-top: 1; }
+#move-summary { margin-top: 1; height: auto; }
+#do-move { width: 100%; margin-top: 1; }
+
+#age-filter { width: 20; }
+#free-target { width: 10; margin-left: 1; }
+#pick-oldest { margin-left: 1; }
+#clean-bar { height: 3; }
+#clean-summary { width: 1fr; height: 3; content-align: left middle; padding: 0 1; }
+
+ConfirmScreen, OpScreen, DirPicker { align: center middle; background: $background 70%; }
+#dialog, #op, #picker { width: 100; max-width: 95%; height: auto; max-height: 90%;
+                        border: round $primary; background: $surface; padding: 1 2; }
+#dialog-title, #op-title, #picker-title { text-style: bold; color: $primary; margin-bottom: 1; }
+#dialog-body { height: auto; max-height: 30; }
+#dialog-buttons, #op-buttons, #picker-buttons { height: auto; align-horizontal: right; margin-top: 1; }
+#dialog-buttons Button, #picker-buttons Button { margin-left: 2; }
+#op-bar { margin: 1 0; }
+#op-bar Bar { width: 1fr; }
+#op-log { height: 10; border: round $panel; margin-top: 1; }
+#picker { height: 80%; }
+#picker-tree { height: 1fr; border: round $panel; }
+"""
+
+
+class ModelSpace(App):
+    TITLE = "model-space"
+    CSS = CSS
+    BINDINGS = [
+        Binding("1", "show_tab('storage')", "Storage"),
+        Binding("2", "show_tab('move')", "Move"),
+        Binding("3", "show_tab('cleanup')", "Clean up"),
+        Binding("r", "rescan", "Rescan"),
+        Binding("q", "quit", "Quit"),
+    ]
+
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.models: list[Model] = []
+        self.disks: list[Disk] = get_disks()
+        self.config = load_json(CONFIG_FILE, {})
+        self.scanning = False
+        self.scanned_at = 0.0
+        self.scan_note = ""
+        self.cancel = threading.Event()
+        self.protected = mount_points() | {HOME, "/"}
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with TabbedContent(id="tabs"):
+            with TabPane("Storage", id="storage"):
+                yield StorageView(id="storage-view")
+            with TabPane("Move models", id="move"):
+                yield MoveView(id="move-view")
+            with TabPane("Clean up", id="cleanup"):
+                yield CleanupView(id="cleanup-view")
+        yield Static(id="status")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        theme = self.config.get("theme", "tokyo-night")
+        if theme in self.available_themes:
+            self.theme = theme
+        self.watch(self, "theme", self._theme_changed, init=False)
+        self.sub_title = os.uname().nodename
+        cached = None if self.args.rescan else load_cache()
+        if cached:
+            self.models, self.scanned_at = cached
+            mark_dups(self.models)
+            mark_bulk(self.models)
+        for v in self.lists():
+            v.set_disks(self.disks)
+        self.call_after_refresh(self.models_changed)
+        self.set_interval(3, self.tick)
+        self.set_interval(20, self.refresh_usage)
+        self.action_rescan()
+        if self.models:
+            self.refresh_usage()
+
+    def lists(self) -> list[ModelList]:
+        return [self.query_one(MoveView), self.query_one(CleanupView)]
+
+    def mount_of(self, m: Model) -> str:
+        return next((d.mount for d in self.disks if d.dev == m.dev), "?")
+
+    def _theme_changed(self, theme: str) -> None:
+        self.config["theme"] = theme
+        save_json(CONFIG_FILE, self.config)
+        self.models_changed()
+
+    # ── refresh plumbing
+    def models_changed(self) -> None:
+        self.query_one(StorageView).refresh_data(self.disks, self.models, self.scanning)
+        for v in self.lists():
+            v.rebuild()
+        self.update_status()
+
+    def tick(self) -> None:
+        for d in self.disks:
+            d.refresh()
+        self.query_one(StorageView).refresh_data(self.disks, self.models, self.scanning)
+        for v in self.lists():
+            v.summary_changed()
+        self.update_status()
+
+    def update_status(self, live: str = "") -> None:
+        p = palette(self)
+        t = Text(no_wrap=True, overflow="ellipsis")
+        if self.scanning:
+            t.append("⟳ scanning ", style=f"bold {p.accent}")
+            t.append(live or self.scan_note, style=p.muted)
+        else:
+            t.append("✔ ", style=p.ok)
+            t.append(f"{len(self.models)} models indexed", style=p.fg)
+            if self.scanned_at:
+                t.append(f" · scanned {ago(self.scanned_at) if days_since(self.scanned_at) >= 1 else time.strftime('%H:%M', time.localtime(self.scanned_at))}", style=p.muted)
+            if self.scan_note:
+                t.append(f" · {self.scan_note}", style=p.muted)
+            t.append(" · r rescans", style=p.muted)
+        for w in self.query("#status"):
+            w.update(t)
+
+    # ── scanning
+    def action_rescan(self) -> None:
+        if self.scanning:
+            return
+        self.scanning = True
+        self.scan_note = "starting…"
+        self.update_status()
+        self.scan_worker()
+
+    @work(thread=True, exclusive=True, group="scan")
+    def scan_worker(self) -> None:
+        t0 = time.monotonic()
+
+        def progress(n: int, path: str) -> None:
+            try:
+                self.call_from_thread(self.update_status, f"{n:,} folders · {short_path(path)}")
+            except RuntimeError:
+                pass
+        disks = get_disks()
+        sc = Scanner(disks, self.args.root, progress)
+        try:
+            models = sc.run(self.args.min_size)
+            ann = annotate(models)
+        except Exception as e:  # keep the TUI alive; show what broke
+            self.call_from_thread(self.scan_failed, repr(e))
+            return
+        self.call_from_thread(self.scan_done, disks, models, ann, time.monotonic() - t0, sc.dirs_seen)
+
+    def scan_failed(self, err: str) -> None:
+        self.scanning = False
+        self.scan_note = f"scan failed: {err}"
+        self.update_status()
+
+    def scan_done(self, disks, models, ann, secs: float, ndirs: int) -> None:
+        self.scanning = False
+        self.disks = disks
+        self.models = models
+        self.scanned_at = time.time()
+        self.scan_note = f"{ndirs:,} folders in {secs:.0f}s"
+        self.apply_annotations(ann, rebuild=False)
+        mark_dups(models)
+        mark_bulk(models)
+        save_cache(models, self.scanned_at)
+        for v in self.lists():
+            v.set_disks(disks)
+        self.models_changed()
+
+    @work(thread=True, exclusive=True, group="usage")
+    def refresh_usage(self) -> None:
+        if self.scanning:
+            return
+        models = list(self.models)
+        ann = annotate(models)
+        self.call_from_thread(self.apply_annotations, ann)
+
+    def apply_annotations(self, ann: dict, rebuild: bool = True) -> None:
+        changed = False
+        for m in self.models:
+            if m.key in ann:
+                users, services, writable = ann[m.key]
+                if (users, services, writable) != (m.users, m.services, m.writable):
+                    m.users, m.services, m.writable = users, services, writable
+                    changed = True
+        if changed and rebuild:
+            for v in self.lists():
+                v.rebuild()
+
+    def action_show_tab(self, tab: str) -> None:
+        self.query_one(TabbedContent).active = tab
+        if tab != "storage":
+            self.call_after_refresh(lambda: self.query_one(f"#{tab}-view", ModelList).table.focus())
+
+    # ── move
+    def confirm_move(self, models: list[Model], dest: str, leave_link: bool) -> None:
+        items, skipped, error = plan_moves(models, dest, self.disks)
+        p = palette(self)
+        dest = os.path.abspath(os.path.expanduser(dest))
+        body = Text()
+        ddisk = disk_for_path(self.disks, dest)
+        if not os.path.isdir(dest):
+            body.append(f"Will create {dest}\n\n", style=p.accent)
+        for it in items:
+            m = it.model
+            body.append("  ▸ ", style=p.accent)
+            body.append(m.name, style=f"bold {p.fg}")
+            body.append(f"  {human(m.size)}  ", style=p.fg)
+            if it.same_fs:
+                body.append("rename (instant)\n", style=p.ok)
+            else:
+                body.append(f"copy {human(it.nbytes)}\n", style=p.accent)
+            body.append(f"      {short_path(m.path)}  →  {short_path(it.pairs[0][1])}"
+                        + (f"  (+{len(it.pairs) - 1} more)" if len(it.pairs) > 1 else "") + "\n", style=p.muted)
+            for u, s in m.services:
+                body.append(f"      referenced by {u} ({s})"
+                            + ("" if leave_link else " — will break without the symlink") + "\n",
+                            style=p.warn if leave_link else p.err)
+        for m, why in skipped:
+            body.append("  ✗ ", style=p.err)
+            body.append(f"{m.name}", style=p.fg)
+            body.append(f" — skipped: {why}\n", style=p.muted)
+        copy_bytes = sum(i.nbytes for i in items)
+        if items:
+            body.append("\n")
+            if copy_bytes and ddisk and not error:
+                body.append(f"{ddisk.mount}: {human(ddisk.free)} free → {human(ddisk.free - copy_bytes)} after\n", style=p.fg)
+            body.append("A symlink will be left at each old location.\n" if leave_link
+                        else "No symlinks will be left behind.\n", style=p.muted)
+            if copy_bytes:
+                body.append("Originals are removed only after every file is copied and verified.", style=p.muted)
+        if error:
+            body.append(f"\n\n{error}", style=f"bold {p.err}")
+        ok = bool(items) and not error
+
+        def go(yes: bool | None) -> None:
+            if yes:
+                if ddisk:
+                    self.config.setdefault("dest", {})[ddisk.mount] = dest
+                    save_json(CONFIG_FILE, self.config)
+                self.start_move(items, leave_link, copy_bytes)
+        self.push_screen(ConfirmScreen(f"Move {len(items)} model{'s' * (len(items) != 1)} to {short_path(dest)}",
+                                       body, f"Move {len(items)}", "primary", can_confirm=ok), go)
+
+    def start_move(self, items: list[MoveItem], leave_link: bool, total: int) -> None:
+        self.cancel.clear()
+        screen = OpScreen(f"Moving {len(items)} model{'s' * (len(items) != 1)}", total or 1, self.cancel)
+        self.push_screen(screen)
+        self.move_worker(items, leave_link, screen)
+
+    @work(thread=True, exclusive=True, group="op")
+    def move_worker(self, items: list[MoveItem], leave_link: bool, screen: OpScreen) -> None:
+        ui = Reporter(self, screen)
+        moved, failed = [], 0
+        for i, it in enumerate(items, 1):
+            m = it.model
+            if self.cancel.is_set():
+                break
+            ui.call(screen.set_current, f"[{i}/{len(items)}] {m.name}")
+            busy = users_of(m, open_weight_files())
+            if busy:
+                ui.call(screen.log_line, f"✗ {m.name}: now in use by {', '.join(busy)} — skipped", "err")
+                failed += 1
+                continue
+            try:
+                execute_move(it, leave_link, ui.progress, self.cancel)
+            except Cancelled:
+                ui.call(screen.log_line, f"✗ {m.name}: cancelled — originals untouched, partial copy removed", "warn")
+                break
+            except Exception as e:
+                ui.call(screen.log_line, f"✗ {m.name}: {e} — originals untouched", "err")
+                failed += 1
+                continue
+            ui.flush()
+            moved.append(it)
+            how = "renamed" if it.same_fs else "copied"
+            ui.call(screen.log_line, f"✔ {m.name} {how} → {short_path(os.path.dirname(it.pairs[0][1]))}", "ok")
+        ui.flush()
+        summary = f"Moved {len(moved)} of {len(items)}" + (f" · {failed} failed" if failed else "")
+        ui.call(screen.finish, summary)
+        ui.call(self.after_move, moved, leave_link)
+
+    def after_move(self, moved: list[MoveItem], leave_link: bool) -> None:
+        for it in moved:
+            m = it.model
+            old_key = m.key
+            m.path = map_moved(m.path, it.pairs)
+            m.files = [map_moved(f, it.pairs) for f in m.files]
+            m.key = m.path
+            d = disk_for_path(self.disks, m.path)
+            if d:
+                m.dev = d.dev
+            if leave_link:
+                m.links = list(m.links) + [s for s, _ in it.pairs]
+            for v in self.lists():
+                v.selected.discard(old_key)
+        self.after_op()
+
+    # ── delete
+    def confirm_delete(self, models: list[Model]) -> None:
+        p = palette(self)
+        ok_models = [m for m in models if not m.users and m.writable]
+        skipped = [m for m in models if m not in ok_models]
+        body = Text()
+        frees = Counter()
+        for m in ok_models:
+            frees[m.dev] += m.frees
+        body.append(f"Frees {human(sum(frees.values()))}\n", style=f"bold {p.ok}")
+        for d in self.disks:
+            if frees[d.dev]:
+                body.append(f"  {d.mount:<14}", style=p.secondary)
+                body.append(f"{human(d.free)} → {human(d.free + frees[d.dev])} free\n", style=p.fg)
+        body.append("\n")
+        for m in sorted(ok_models, key=lambda m: m.last_used):
+            body.append(f"  {ago(m.last_used):>10}  ", style=age_style(p, m.last_used))
+            body.append(m.name, style=f"bold {p.fg}")
+            body.append(f"  {human(m.size)}\n", style=p.fg)
+            what = (f"Ollama model ({'ollama rm' if not os.access(m.extra.get('store', ''), os.W_OK) else 'manifest + unshared blobs'})"
+                    if m.source == "ollama" else
+                    f"{short_path(m.path)}/  (whole folder)" if m.is_dir else
+                    f"{short_path(m.location)}/  ({m.nfiles} files)" if m.nfiles > 1 else short_path(m.path))
+            body.append(f"              {what}\n", style=p.muted)
+            for u, s in m.services:
+                body.append(f"              ⚠ referenced by {u} ({s}) — it will fail to start\n", style=p.warn)
+            for dpath in m.dups[:1]:
+                body.append(f"              another copy stays at {short_path(dpath)}\n", style=p.primary)
+            if m.links:
+                body.append(f"              {len(m.links)} symlink(s) to it will be removed\n", style=p.muted)
+        for m in skipped:
+            why = f"in use by {', '.join(m.users)}" if m.users else "no permission"
+            body.append(f"  ✗ {m.name} — skipped: {why}\n", style=p.err)
+        body.append("\nThis cannot be undone.", style=f"bold {p.err}")
+
+        def go(yes: bool | None) -> None:
+            if yes:
+                self.start_delete(ok_models)
+        self.push_screen(ConfirmScreen(f"Delete {len(ok_models)} model{'s' * (len(ok_models) != 1)}?",
+                                       body, f"Delete {len(ok_models)}", "error", can_confirm=bool(ok_models)), go)
+
+    def start_delete(self, models: list[Model]) -> None:
+        self.cancel.clear()
+        screen = OpScreen(f"Deleting {len(models)} model{'s' * (len(models) != 1)}",
+                          sum(m.size for m in models), self.cancel)
+        self.push_screen(screen)
+        self.delete_worker(models, screen)
+
+    @work(thread=True, exclusive=True, group="op")
+    def delete_worker(self, models: list[Model], screen: OpScreen) -> None:
+        ui = Reporter(self, screen)
+        gone, failed = [], 0
+        omap = open_weight_files()
+        for i, m in enumerate(models, 1):
+            if self.cancel.is_set():
+                ui.call(screen.log_line, "Stopped — remaining models were left alone.", "warn")
+                break
+            ui.call(screen.set_current, f"[{i}/{len(models)}] {m.name}")
+            busy = users_of(m, omap)
+            if busy:
+                ui.call(screen.log_line, f"✗ {m.name}: in use by {', '.join(busy)} — skipped", "err")
+                failed += 1
+                continue
+            try:
+                execute_delete(m, self.protected)
+            except Exception as e:
+                ui.call(screen.log_line, f"✗ {m.name}: {e}", "err")
+                failed += 1
+                continue
+            gone.append(m)
+            ui.progress(m.size)
+            ui.flush()
+            ui.call(screen.log_line, f"✔ deleted {m.name} ({human(m.frees)})", "ok")
+        summary = f"Deleted {len(gone)} of {len(models)} · freed {human(sum(m.frees for m in gone))}" \
+            + (f" · {failed} failed" if failed else "")
+        ui.call(screen.finish, summary)
+        ui.call(self.after_delete, gone)
+
+    def after_delete(self, gone: list[Model]) -> None:
+        keys = {m.key for m in gone}
+        self.models = [m for m in self.models if m.key not in keys]
+        for v in self.lists():
+            v.selected -= keys
+        self.after_op()
+
+    def after_op(self) -> None:
+        for d in self.disks:
+            d.refresh()
+        mark_dups(self.models)
+        mark_bulk(self.models)
+        save_cache(self.models, self.scanned_at)
+        self.models_changed()
+        self.refresh_usage()
+
+
+class Reporter:
+    """Batches progress from a worker thread into ~10 UI updates a second."""
+
+    def __init__(self, app: App, screen: OpScreen):
+        self.app, self.screen = app, screen
+        self.pending = 0
+        self.last = 0.0
+
+    def call(self, fn, *args) -> None:
+        try:
+            self.app.call_from_thread(fn, *args)
+        except RuntimeError:
+            pass
+
+    def progress(self, n: int) -> None:
+        self.pending += n
+        now = time.monotonic()
+        if now - self.last >= 0.1:
+            self.flush()
+            self.last = now
+
+    def flush(self) -> None:
+        if self.pending:
+            n, self.pending = self.pending, 0
+            self.call(self.screen.advance, n)
+
+
+def print_list(args) -> None:
+    disks = get_disks()
+    for d in disks:
+        print(f"{d.mount:<14} {human(d.used):>10} used {human(d.free):>10} free  {d.frac * 100:4.0f}%  {d.label}")
+    t0 = time.monotonic()
+    sc = Scanner(disks, args.root)
+    models = sc.run(args.min_size)
+    ann = annotate(models)
+    for m in models:
+        m.users, m.services, m.writable = ann[m.key]
+    mark_dups(models)
+    mark_bulk(models)
+    save_cache(models, time.time())
+    mount = {d.dev: d.mount for d in disks}
+    print(f"\n{len(models)} models, {human(model_bytes(models))}, "
+          f"{sc.dirs_seen:,} folders in {time.monotonic() - t0:.1f}s\n")
+    for m in sorted(models, key=lambda m: m.last_used):
+        flags = " ".join(f for f, on_ in [("USE", m.users), ("SVC", ",".join(u for u, _ in m.services)), ("DUP", m.dups),
+                                           ("LINK", m.links), ("RO", not m.writable)] if on_)
+        print(f"{used_label(m):>10}  {human(m.size):>9}  {m.format_label:<14} "
+              f"{mount.get(m.dev, '?'):<11} {m.name[:50]:<50} {short_path(m.path, 60):<60} {flags}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rescan", action="store_true", help="ignore the cached index on startup")
+    ap.add_argument("--min-size", type=parse_size, default=parse_size("200M"),
+                    help="hide models smaller than this (default 200M)")
+    ap.add_argument("--root", action="append", default=[], help="extra folder to scan (repeatable)")
+    ap.add_argument("--list", action="store_true", help="print the index (and refresh the cache) and exit")
+    args = ap.parse_args()
+    if args.list:
+        print_list(args)
+        return
+    ModelSpace(args).run()
+
+
+if __name__ == "__main__":
+    main()
